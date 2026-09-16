@@ -1,0 +1,4 @@
+Experiment,Architecture Change,Expected Result,Train Acc,Val Acc,Test Acc,Test Loss,Params,Result
+Baseline CNN,3 Conv blocks (32-64-128),Reference point,91.1210298538208,97.22222089767456,84.95,0.6262,101699,-
+Simpler CNN,Removed the Conv128 block,"Lower capacity, maybe better generalization",90.27777910232544,81.15079402923584,55.37634491920471,1.491347074508667,23747,Worse (-29.57 pts)
+Deeper CNN,Added a Conv256 block,Better feature extraction,100.0,100.0,93.01075339317322,0.3884802758693695,405059,Better (+8.06 pts)
