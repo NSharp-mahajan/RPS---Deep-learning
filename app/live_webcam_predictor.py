@@ -22,6 +22,7 @@ except ImportError:
 
 import numpy as np
 import streamlit as st
+import mediapipe as mp
 
 # Attempt to import WebRTC components
 try:
@@ -44,8 +45,18 @@ except ImportError:
 # Target frame dimensions for the trained CNN model
 IMG_SIZE: Tuple[int, int] = (128, 128)
 
-# Model class mapping (0: Rock, 1: Paper, 2: Scissors)
+# Model class mapping — matches TFDS rock_paper_scissors label order:
+#   index 0 → rock, index 1 → paper, index 2 → scissors
 CLASS_NAMES: list[str] = ["Rock", "Paper", "Scissors"]
+
+mp_hands = mp.solutions.hands
+
+HAND_DETECTOR = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5,
+)
 
 CLASS_ICONS: dict[str, str] = {
     "Rock": "✊ ROCK",
@@ -57,13 +68,17 @@ CLASS_ICONS: dict[str, str] = {
 PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
 MODEL_PATH: Path = PROJECT_ROOT / "models" / "rps_cnn.keras"
 
-# Public STUN servers for WebRTC connectivity
-RTC_CONFIG = RTCConfiguration({
-    "iceServers": [
-        {"urls": ["stun:stun.l.google.com:19302"]},
-        {"urls": ["stun:stun1.l.google.com:19302"]},
-    ]
-})
+# Public STUN servers for WebRTC connectivity (guarded to avoid NameError if
+# streamlit-webrtc is not installed)
+if WEBRTC_AVAILABLE:
+    RTC_CONFIG = RTCConfiguration({
+        "iceServers": [
+            {"urls": ["stun:stun.l.google.com:19302"]},
+            {"urls": ["stun:stun1.l.google.com:19302"]},
+        ]
+    })
+else:
+    RTC_CONFIG = None
 
 
 # ==============================================================================
@@ -116,6 +131,34 @@ def preprocess_frame(bgr_image: np.ndarray, target_size: Tuple[int, int] = IMG_S
     batch_tensor = np.expand_dims(normalized, axis=0)
     return batch_tensor
 
+def detect_and_crop_hand(bgr_image: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Detect one hand and return a cropped BGR image.
+    Returns None when no hand is detected.
+    """
+
+    rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+    results = HAND_DETECTOR.process(rgb_image)
+
+    if not results.multi_hand_landmarks:
+        return None
+
+    hand_landmarks = results.multi_hand_landmarks[0]
+
+    h, w, _ = bgr_image.shape
+
+    x_coords = [int(lm.x * w) for lm in hand_landmarks.landmark]
+    y_coords = [int(lm.y * h) for lm in hand_landmarks.landmark]
+
+    x_min = max(min(x_coords) - 30, 0)
+    x_max = min(max(x_coords) + 30, w)
+    y_min = max(min(y_coords) - 30, 0)
+    y_max = min(max(y_coords) + 30, h)
+
+    if x_max <= x_min or y_max <= y_min:
+        return None
+
+    return bgr_image[y_min:y_max, x_min:x_max]
 
 def predict_gesture(model, preprocessed_tensor: np.ndarray) -> np.ndarray:
     """
@@ -144,8 +187,8 @@ if WEBRTC_AVAILABLE:
         def __init__(self, model):
             self.model = model
             self.lock = threading.Lock()
-            # History buffer of recent probabilities for smoothing (size 5)
-            self.history = deque(maxlen=5)
+            # History buffer of recent probabilities for smoothing
+            self.history = deque(maxlen=1)
             self.latest_label: str = "Awaiting hand gesture..."
             self.latest_confidence: float = 0.0
             self.latest_probabilities: dict[str, float] = {
@@ -160,13 +203,48 @@ if WEBRTC_AVAILABLE:
 
             if self.model is not None:
                 try:
-                    # Preprocess frame
-                    tensor = preprocess_frame(img, target_size=IMG_SIZE)
+                    # Detect a hand before sending anything to the CNN.
+                    # The CNN is a 3-class classifier, so without this gate it
+                    # will always force an empty/background frame into one class.
+                    hand_crop = detect_and_crop_hand(img)
 
-                    # Model prediction
+                    if hand_crop is None:
+                        with self.lock:
+                            self.latest_label = "No Gesture"
+                            self.latest_confidence = 0.0
+                            self.latest_probabilities = {
+                                "Rock": 0.0,
+                                "Paper": 0.0,
+                                "Scissors": 0.0,
+                            }
+                            self.has_prediction = False
+                            self.history.clear()
+
+                        if CV2_AVAILABLE:
+                            h, w, _ = img.shape
+                            overlay = img.copy()
+                            cv2.rectangle(overlay, (0, 0), (w, 55), (15, 23, 42), -1)
+                            cv2.addWeighted(overlay, 0.65, img, 0.35, 0, img)
+                            cv2.putText(
+                                img,
+                                "NO HAND DETECTED",
+                                (20, 38),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.9,
+                                (255, 255, 255),
+                                2,
+                                cv2.LINE_AA,
+                            )
+
+                        return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+                    # Preprocess ONLY the detected hand crop.
+                    tensor = preprocess_frame(hand_crop, target_size=IMG_SIZE)
+
+                    # Model prediction.
                     raw_probs = predict_gesture(self.model, tensor)
 
-                    # Apply lightweight prediction smoothing
+                    # Apply lightweight prediction smoothing.
                     with self.lock:
                         self.history.append(raw_probs)
                         smoothed_probs = np.mean(self.history, axis=0)
@@ -291,7 +369,7 @@ def render_prediction_panel(label: str, confidence: float, probabilities: dict[s
                 margin-bottom: 20px;
             ">
                 <div style="font-size: 1.3rem; color: #94a3b8;">
-                    Show Rock, Paper, or Scissors to the camera.
+                    Show your hand and make Rock, Paper, or Scissors.
                 </div>
             </div>
             """,
@@ -423,6 +501,18 @@ def main():
                 if has_pred:
                     with prediction_placeholder.container():
                         render_prediction_panel(lbl, conf, probs, active=True)
+                elif lbl == "No Gesture":
+                    with prediction_placeholder.container():
+                        render_prediction_panel(
+                            label="No Gesture",
+                            confidence=0.0,
+                            probabilities={
+                                "Rock": 0.0,
+                                "Paper": 0.0,
+                                "Scissors": 0.0,
+                            },
+                            active=False,
+                        )
             time.sleep(0.08)
 
     # Model Information Footer Panel
@@ -436,9 +526,9 @@ def main():
     with info_col3:
         st.metric(label="Classes", value="Rock • Paper • Scissors")
     with info_col4:
-        st.metric(label="Recorded Test Accuracy", value="96.51%")
+        st.metric(label="Recorded Test Accuracy", value="98.66%")
 
-    st.caption("Note: Test accuracy is 96.51%. Actual prediction confidence depends on lighting, framing, and hand orientation.")
+    st.caption("Note: Test accuracy is 98.66% on the TFDS rock_paper_scissors test split (Regularized CNN). Actual prediction confidence depends on lighting, framing, and hand orientation.")
 
 
 if __name__ == "__main__":

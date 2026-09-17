@@ -1,147 +1,113 @@
 # RPS CNN Battle
 
-A collaborative deep learning project developed by a team of 4 members, focused on building and evaluating a Convolutional Neural Network (CNN) for classifying Rock, Paper, and Scissors images using TensorFlow and TensorFlow Datasets.
+Rock-Paper-Scissors image classification using TensorFlow/Keras and the official TensorFlow Dataset [`rock_paper_scissors`](https://www.tensorflow.org/datasets/catalog/rock_paper_scissors). Built as a collaborative deep learning university project by a team of 4.
 
 ## Project Overview
 
-This project explores the full pipeline of a computer vision task:
+The project explores the full computer vision pipeline: dataset loading, preprocessing, CNN architecture experimentation, evaluation, and a live webcam demo app.
 
-- Load the Rock, Paper, Scissors dataset from TensorFlow Datasets
-- Inspect dataset distribution and sample images
-- Preprocess images for CNN training
-- Build a baseline CNN model
-- Train and evaluate the model
-- Analyze performance using metrics such as accuracy, loss, confusion matrix, and classification reports
+**Main notebook:** `notebooks/rps_cnn_battels.ipynb`  
+**Live app:** `app/live_webcam_predictor.py`
 
-The main work is currently documented in the notebook:
+---
 
-- `notebooks/rps_cnn_battle.ipynb`
+## Class Mapping
 
-## Team
+The TFDS `rock_paper_scissors` dataset assigns labels in alphabetical order:
 
-This project is being developed by a team of 4 people.
+| Index | Class |
+|-------|-------|
+| 0 | rock |
+| 1 | paper |
+| 2 | scissors |
 
-## Current Progress
+This mapping is used consistently in the notebook, CSVs, and the Streamlit application.
 
-### 1. Dataset Setup
-The project successfully loaded the `rock_paper_scissors` dataset using TensorFlow Datasets.
+---
 
-Key steps completed:
-- Downloaded and prepared the dataset
-- Loaded train, validation, and test splits
-- Verified dataset structure, class names, and image shape
+## Experiments
 
-### 2. Data Exploration
-The dataset was explored to understand class balance and sample images.
+All five models were trained on 80% of the TFDS training split and evaluated on the official held-out test set (372 images). Input size: 128×128×3, optimizer: Adam.
 
-Completed tasks:
-- Checked train/test label distributions
-- Visualized sample images from the training set
-- Confirmed the class labels are:
-  - `paper`
-  - `rock`
-  - `scissors`
+| Experiment | Architecture | Test Acc | Test Loss | Params |
+|---|---|---|---|---|
+| Baseline CNN | 3 Conv blocks (32-64-128) + GAP | 84.95% | 0.6262 | 101,699 |
+| Simpler CNN | 2 Conv blocks (32-64) + GAP | 69.09% | 1.2696 | 23,747 |
+| Deeper CNN | 4 Conv blocks (32-64-128-256) + GAP | 97.31% | 0.2262 | 405,059 |
+| **Regularized CNN** *(final)* | Deeper CNN + Dropout(0.5) | **96.24%** | 0.0734 | 405,059 |
+| MobileNetV2 (frozen) | MobileNetV2 backbone + GAP + Dropout | 88.17% | 0.3279 | — |
+| MobileNetV2 (fine-tuned) | Unfroze last 30 layers, lr=1e-5 | 90.32% | 0.2825 | — |
 
-### 3. CNN Pipeline Design
-A baseline CNN pipeline was designed for the task.
+> **Note:** Metrics for the baseline–regularized CNN rows are from the original notebook training run. The saved `models/rps_cnn.keras` was produced by a fresh retrain using the same architecture and hyperparameters, achieving **98.66%** test accuracy.
 
-Pipeline stages:
-- Resize images to `128 x 128`
-- Normalize pixel values from `0-255` to `0-1`
-- Conv2D + ReLU
-- MaxPooling
-- Conv2D + ReLU
-- MaxPooling
-- Conv2D + ReLU
-- MaxPooling
-- GlobalAveragePooling
-- Dense layer
-- 3-class softmax output
+---
 
-### 4. Baseline Model Training
-A baseline CNN model was implemented and trained.
+## Final Model
 
-Architecture highlights:
-- Input size: `128 x 128 x 3`
-- Batch size: `32`
-- Optimizer: Adam
-- Loss: Sparse Categorical Crossentropy
-- Metric: Accuracy
+**Architecture:** Regularized CNN (4 Conv blocks + Dropout(0.5))  
+**Saved to:** `models/rps_cnn.keras`  
+**Verified test accuracy (current saved model):** 98.66%
 
-Training setup:
-- Training split: 80% of original training split
-- Validation split: remaining 20% of original training split
-- Test split: kept separate for final evaluation
-
-### 5. Baseline Evaluation
-The baseline model was evaluated on the held-out test set.
-
-Key results:
-- Training accuracy: `99.50%`
-- Validation accuracy: `99.80%`
-- Test accuracy: `84.95%`
-- Test loss: `0.6262`
-
-### 6. Error Analysis
-The model performed very strongly on training and validation data, but accuracy dropped on the test set.
-
-This suggests a possible generalization gap, likely caused by differences in:
-- hand pose
-- lighting
-- background
-- image composition
-- dataset distribution differences between train/validation and test sets
-
-The project includes:
-- confusion matrix
-- classification report
-- sample predictions with true vs predicted labels
+---
 
 ## Repository Structure
 
 ```text
 RPS-Project/
+├── app/
+│   └── live_webcam_predictor.py  # Streamlit webcam app
+├── models/
+│   └── rps_cnn.keras             # Saved final model
 ├── notebooks/
-│   └── rps_cnn_battle.ipynb
-├── README.md
-└── ...
+│   ├── rps_cnn_battels.ipynb     # Main experiment notebook
+│   ├── master_experiment_table.csv
+│   ├── final_model_comparison.csv
+│   ├── model_vs_test_accuracy.png
+│   └── train_val_test_accuracy.png
+├── requirements.txt
+└── README.md
 ```
+
+---
+
+## Setup
+
+### Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+Or manually:
+
+```bash
+pip install tensorflow tensorflow-datasets numpy matplotlib pandas scikit-learn \
+            streamlit streamlit-webrtc av opencv-python Pillow
+```
+
+### Run the notebook
+
+Open and run all cells top-to-bottom:
+
+```bash
+jupyter notebook notebooks/rps_cnn_battels.ipynb
+```
+
+> The notebook loads the dataset, trains all models, and saves `models/rps_cnn.keras`.
+
+### Run the Streamlit app
+
+```bash
+streamlit run app/live_webcam_predictor.py
+```
+
+The app requires `models/rps_cnn.keras` to exist. Run the notebook first to produce this file, or it will show a warning with instructions.
+
+---
 
 ## Key Findings
 
-- The dataset is successfully loaded and usable for training.
-- The baseline CNN learns the task very well on seen data.
-- The trained model generalizes reasonably well, but there is still a visible test-time performance gap.
-- The current notebook provides a solid foundation for further experiments such as:
-  - data augmentation
-  - regularization
-  - architecture tuning
-  - transfer learning
-  - improved evaluation and visualization
-
-## Setup Instructions
-
-### Prerequisites
-
-Install the required Python libraries:
-
-```bash
-pip install tensorflow tensorflow-datasets matplotlib numpy scikit-learn
-```
-
-### Run the Notebook
-
-Open and execute:
-
-```text
-notebooks/rps_cnn_battle.ipynb
-```
-
-## Notes
-
-This README reflects the project progress completed so far. The project is currently in the baseline analysis and evaluation phase, with room for further improvements and experiments.
-
-
-## Conclusion
-
-The project has successfully completed the initial deep learning workflow for a Rock, Paper, Scissors classification task, from dataset loading to baseline training and evaluation. The baseline model demonstrates strong learning capability, while the next phase should focus on improving robustness and reducing the observed train/validation/test performance gap.
+- The Deeper CNN (4 convolutional blocks) substantially improved test accuracy from 84.95% to 97.31% compared with the baseline.
+- Adding Dropout(0.5) in the Regularized CNN reduced the generalization gap while maintaining high test accuracy.
+- MobileNetV2 transfer learning achieved 90.32% test accuracy after fine-tuning — strong but below our custom CNN.
+- The Regularized CNN was selected as the final model for deployment in the live Streamlit demo.

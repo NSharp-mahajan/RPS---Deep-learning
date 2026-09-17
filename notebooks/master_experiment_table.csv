@@ -3,3 +3,4 @@ Baseline CNN,3 Conv blocks (32-64-128),Reference point,97.17261791229248,97.6190
 Simpler CNN,Removed the Conv128 block,"Lower capacity, maybe better generalization",94.09722089767456,87.10317611694336,69.08602118492126,1.2695536613464355,23747,Worse (-15.86 pts)
 Deeper CNN,Added a Conv256 block,Better feature extraction,100.0,100.0,97.31183052062988,0.2262265533208847,405059,Better (+12.36 pts)
 Regularized CNN,Deeper CNN + Dropout(0.5) after GAP,Smaller generalization gap,99.70238208770752,100.0,96.23655676841736,0.0733550488948822,405059,Better (+11.29 pts)
+Transfer Learning (MobileNetV2),MobileNetV2 frozen + fine-tuned head,"Transfer learning from ImageNet, fine-tuned",,,90.32257795333862,0.28246989846229553,,Fine-tuned from frozen (88.17%)
