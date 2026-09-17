@@ -1,6 +1,5 @@
 Experiment,Architecture Change,Expected Result,Train Acc,Val Acc,Test Acc,Test Loss,Params,Result
-Baseline CNN,3 Conv blocks (32-64-128),Reference point,97.17261791229248,97.6190447807312,84.95,0.6262,101699,-
-Simpler CNN,Removed the Conv128 block,"Lower capacity, maybe better generalization",94.09722089767456,87.10317611694336,69.08602118492126,1.2695536613464355,23747,Worse (-15.86 pts)
-Deeper CNN,Added a Conv256 block,Better feature extraction,100.0,100.0,97.31183052062988,0.2262265533208847,405059,Better (+12.36 pts)
-Regularized CNN,Deeper CNN + Dropout(0.5) after GAP,Smaller generalization gap,99.70238208770752,100.0,96.23655676841736,0.0733550488948822,405059,Better (+11.29 pts)
-Transfer Learning (MobileNetV2),MobileNetV2 frozen + fine-tuned head,"Transfer learning from ImageNet, fine-tuned",,,90.32257795333862,0.28246989846229553,,Fine-tuned from frozen (88.17%)
+Baseline CNN,3 Conv blocks (32-64-128),Reference point,99.20634627342224,99.60317611694336,84.95,0.6262,101699,-
+Simpler CNN,Removed the Conv128 block,"Lower capacity, maybe better generalization",95.73412537574768,95.03968358039856,60.752689838409424,1.1562308073043823,23747,Worse (-24.20 pts)
+Deeper CNN,Added a Conv256 block,Better feature extraction,100.0,100.0,85.75268983840942,0.5734155178070068,405059,About the same
+Regularized CNN,Deeper CNN + Dropout(0.5) after GAP,Smaller generalization gap,99.80158805847168,100.0,100.0,0.011064569465816021,405059,Better (+15.05 pts)

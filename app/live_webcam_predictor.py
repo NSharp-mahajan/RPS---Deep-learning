@@ -1,534 +1,452 @@
-"""
-ROCK • PAPER • SCISSORS — AI Gesture Classifier
-------------------------------------------------
-Live real-time webcam prediction application using a custom CNN.
-Captures continuous video frames via WebRTC, runs model-aligned
-preprocessing (128x128, RGB, normalized [0, 1]), applies prediction
-smoothing, and renders live predictions with confidence and class probabilities.
-"""
-
-from collections import deque
 from pathlib import Path
+from collections import deque
 import threading
+import queue
 import time
-from typing import Optional, Tuple
 
-# Safe imports
-try:
-    import cv2
-    CV2_AVAILABLE = True
-except ImportError:
-    CV2_AVAILABLE = False
-
-import numpy as np
-import streamlit as st
-import mediapipe as mp
-
-# Attempt to import WebRTC components
 try:
     import av
+except ImportError:
+    av = None
+
+import numpy as np
+from PIL import Image
+import streamlit as st
+import tensorflow as tf
+import mediapipe as mp
+
+try:
     from streamlit_webrtc import (
-        RTCConfiguration,
         VideoProcessorBase,
         WebRtcMode,
         webrtc_streamer,
     )
-    WEBRTC_AVAILABLE = True
 except ImportError:
-    WEBRTC_AVAILABLE = False
+    webrtc_streamer = None
+    VideoProcessorBase = object
+    WebRtcMode = None
 
 
-# ==============================================================================
-# Configuration & Constants
-# ==============================================================================
+# ============================================================
+# CONFIGURATION & CONSTANTS
+# ============================================================
 
-# Target frame dimensions for the trained CNN model
-IMG_SIZE: Tuple[int, int] = (128, 128)
-
-# Model class mapping — matches TFDS rock_paper_scissors label order:
-#   index 0 → rock, index 1 → paper, index 2 → scissors
-CLASS_NAMES: list[str] = ["Rock", "Paper", "Scissors"]
-
-mp_hands = mp.solutions.hands
-
-HAND_DETECTOR = mp_hands.Hands(
-    static_image_mode=False,
-    max_num_hands=1,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5,
-)
-
-CLASS_ICONS: dict[str, str] = {
-    "Rock": "✊ ROCK",
-    "Paper": "✋ PAPER",
-    "Scissors": "✌️ SCISSORS",
+IMG_SIZE = (128, 128)
+CLASS_NAMES = ["Rock", "Paper", "Scissors"]
+CLASS_ICONS = {
+    "Rock": "✊",
+    "Paper": "✋",
+    "Scissors": "✌️",
 }
 
-# Dynamic, portable path resolution relative to this application file
-PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
-MODEL_PATH: Path = PROJECT_ROOT / "models" / "rps_cnn.keras"
-
-# Public STUN servers for WebRTC connectivity (guarded to avoid NameError if
-# streamlit-webrtc is not installed)
-if WEBRTC_AVAILABLE:
-    RTC_CONFIG = RTCConfiguration({
-        "iceServers": [
-            {"urls": ["stun:stun.l.google.com:19302"]},
-            {"urls": ["stun:stun1.l.google.com:19302"]},
-        ]
-    })
-else:
-    RTC_CONFIG = None
+# Portable model path resolution based on project root
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+MODEL_PATH = PROJECT_ROOT / "models" / "rps_cnn.keras"
 
 
-# ==============================================================================
-# Model Loading & Caching
-# ==============================================================================
+# ============================================================
+# MODEL LOADING (CACHED ONCE)
+# ============================================================
 
-@st.cache_resource(show_spinner=False)
-def load_model(path: Path):
-    """
-    Load the trained Keras model from disk once.
-    Cached across sessions so it is never reloaded per frame or rerun.
-    """
-    if not path.exists():
+@st.cache_resource
+def load_model():
+    """Load the trained Keras CNN model once and cache it."""
+    if not MODEL_PATH.exists():
         return None
-
-    import tensorflow as tf
     try:
-        loaded_model = tf.keras.models.load_model(str(path))
-        return loaded_model
-    except Exception as err:
-        st.error(f"Error loading trained model from '{path}': {err}")
+        return tf.keras.models.load_model(str(MODEL_PATH), compile=False)
+    except Exception as exc:
+        print(f"[Model Load Error]: {exc}")
         return None
 
 
-# ==============================================================================
-# Preprocessing Pipeline (Exact Match to Training)
-# ==============================================================================
+# ============================================================
+# LIVE WEBRTC VIDEO PROCESSOR (MEDIAPIPE + CNN DECOUPLED)
+# ============================================================
 
-def preprocess_frame(bgr_image: np.ndarray, target_size: Tuple[int, int] = IMG_SIZE) -> np.ndarray:
+class RPSVideoProcessor(VideoProcessorBase):
     """
-    Preprocess a raw BGR frame from OpenCV / WebRTC for the custom CNN:
-      1. Convert BGR to RGB.
-      2. Resize to 128 x 128 using bilinear interpolation.
-      3. Cast pixel values to float32.
-      4. Normalize to [0.0, 1.0] by dividing by 255.0.
-      5. Add batch dimension -> (1, 128, 128, 3).
-    """
-    if CV2_AVAILABLE:
-        rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
-        resized = cv2.resize(rgb, target_size, interpolation=cv2.INTER_LINEAR)
-        normalized = resized.astype(np.float32) / 255.0
-    else:
-        from PIL import Image
-        # BGR to RGB via array slicing
-        rgb_arr = bgr_image[:, :, ::-1] if len(bgr_image.shape) == 3 and bgr_image.shape[2] == 3 else bgr_image
-        pil_img = Image.fromarray(rgb_arr)
-        resized_pil = pil_img.resize(target_size, Image.Resampling.BILINEAR)
-        normalized = np.asarray(resized_pil, dtype=np.float32) / 255.0
-
-    batch_tensor = np.expand_dims(normalized, axis=0)
-    return batch_tensor
-
-def detect_and_crop_hand(bgr_image: np.ndarray) -> Optional[np.ndarray]:
-    """
-    Detect one hand and return a cropped BGR image.
-    Returns None when no hand is detected.
+    WebRTC video processor that decouples video streaming from inference.
+    Webcam frames in recv() are immediately queued without blocking.
+    A background daemon thread handles MediaPipe hand detection,
+    bounding box cropping with padding, and CNN inference.
     """
 
-    rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
-    results = HAND_DETECTOR.process(rgb_image)
+    latest_instance = None
 
-    if not results.multi_hand_landmarks:
-        return None
+    def __init__(self):
+        RPSVideoProcessor.latest_instance = self
+        self.lock = threading.Lock()
+        self.model = load_model()
 
-    hand_landmarks = results.multi_hand_landmarks[0]
+        # Shared prediction state
+        self.prediction = "NO HAND DETECTED"
+        self.confidence = 0.0
+        self.rock_probability = 0.0
+        self.paper_probability = 0.0
+        self.scissors_probability = 0.0
+        self.probabilities = {"Rock": 0.0, "Paper": 0.0, "Scissors": 0.0}
+        self.hand_detected = False
+        self.latest_frame_timestamp = time.time()
 
-    h, w, _ = bgr_image.shape
+        self.history = deque(maxlen=5)
+        self.has_logged_error = False
 
-    x_coords = [int(lm.x * w) for lm in hand_landmarks.landmark]
-    y_coords = [int(lm.y * h) for lm in hand_landmarks.landmark]
+        # Drop-oldest queue of maxsize=1 so worker always processes the newest frame
+        self.frame_queue = queue.Queue(maxsize=1)
+        self.running = True
 
-    x_min = max(min(x_coords) - 30, 0)
-    x_max = min(max(x_coords) + 30, w)
-    y_min = max(min(y_coords) - 30, 0)
-    y_max = min(max(y_coords) + 30, h)
+        # Dedicated background inference worker thread
+        self.worker_thread = threading.Thread(
+            target=self.inference_worker,
+            daemon=True,
+        )
+        self.worker_thread.start()
 
-    if x_max <= x_min or y_max <= y_min:
-        return None
+    def _set_no_hand(self):
+        """Set state to NO HAND DETECTED and clear smoothing history."""
+        self.history.clear()
+        with self.lock:
+            self.prediction = "NO HAND DETECTED"
+            self.confidence = 0.0
+            self.rock_probability = 0.0
+            self.paper_probability = 0.0
+            self.scissors_probability = 0.0
+            self.probabilities = {"Rock": 0.0, "Paper": 0.0, "Scissors": 0.0}
+            self.hand_detected = False
+            self.latest_frame_timestamp = time.time()
 
-    return bgr_image[y_min:y_max, x_min:x_max]
-
-def predict_gesture(model, preprocessed_tensor: np.ndarray) -> np.ndarray:
-    """
-    Run forward pass through the custom CNN and return raw softmax probabilities.
-    Output shape: (3,) corresponding to [Rock, Paper, Scissors].
-    """
-    raw_probs = model.predict(preprocessed_tensor, verbose=0)
-    return raw_probs[0]
-
-
-# ==============================================================================
-# Live Video Stream Processor with Prediction Smoothing
-# ==============================================================================
-
-if WEBRTC_AVAILABLE:
-    class LiveVideoProcessor(VideoProcessorBase):
+    def inference_worker(self):
         """
-        Processes continuous incoming video frames in a background thread:
-          - Preprocesses each frame
-          - Performs model inference
-          - Smooths predictions over recent frames to prevent visual jitter
-          - Draws an on-frame HUD overlay
-          - Exposes thread-safe state for UI rendering
+        Background worker thread:
+        Runs MediaPipe hand detection and crops hand region,
+        then feeds cropped hand to CNN inference.
         """
+        mp_hands = mp.solutions.hands
+        hands = mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
 
-        def __init__(self, model):
-            self.model = model
-            self.lock = threading.Lock()
-            # History buffer of recent probabilities for smoothing
-            self.history = deque(maxlen=1)
-            self.latest_label: str = "Awaiting hand gesture..."
-            self.latest_confidence: float = 0.0
-            self.latest_probabilities: dict[str, float] = {
-                "Rock": 0.0,
-                "Paper": 0.0,
-                "Scissors": 0.0,
-            }
-            self.has_prediction: bool = False
+        last_inference_time = 0.0
+        min_interval = 0.15  # Approx 6-7 FPS inference rate
 
-        def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-            img = frame.to_ndarray(format="bgr24")
+        while self.running:
+            try:
+                # Wait for newest frame
+                image = self.frame_queue.get(timeout=0.2)
+                while True:
+                    try:
+                        image = self.frame_queue.get_nowait()
+                    except queue.Empty:
+                        break
+            except queue.Empty:
+                continue
 
-            if self.model is not None:
-                try:
-                    # Detect a hand before sending anything to the CNN.
-                    # The CNN is a 3-class classifier, so without this gate it
-                    # will always force an empty/background frame into one class.
-                    hand_crop = detect_and_crop_hand(img)
+            active_model = self.model if self.model is not None else load_model()
+            if active_model is None:
+                continue
 
-                    if hand_crop is None:
-                        with self.lock:
-                            self.latest_label = "No Gesture"
-                            self.latest_confidence = 0.0
-                            self.latest_probabilities = {
-                                "Rock": 0.0,
-                                "Paper": 0.0,
-                                "Scissors": 0.0,
-                            }
-                            self.has_prediction = False
-                            self.history.clear()
+            # Throttle inference rate to preserve CPU headroom
+            now = time.monotonic()
+            elapsed = now - last_inference_time
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
 
-                        if CV2_AVAILABLE:
-                            h, w, _ = img.shape
-                            overlay = img.copy()
-                            cv2.rectangle(overlay, (0, 0), (w, 55), (15, 23, 42), -1)
-                            cv2.addWeighted(overlay, 0.65, img, 0.35, 0, img)
-                            cv2.putText(
-                                img,
-                                "NO HAND DETECTED",
-                                (20, 38),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.9,
-                                (255, 255, 255),
-                                2,
-                                cv2.LINE_AA,
-                            )
+            try:
+                h, w, _ = image.shape
 
-                        return av.VideoFrame.from_ndarray(img, format="bgr24")
+                # 1. BGR -> RGB using numpy slicing (no cv2)
+                rgb = image[:, :, ::-1].copy()
 
-                    # Preprocess ONLY the detected hand crop.
-                    tensor = preprocess_frame(hand_crop, target_size=IMG_SIZE)
+                # 2. MediaPipe Hand Detection
+                mp_results = hands.process(rgb)
 
-                    # Model prediction.
-                    raw_probs = predict_gesture(self.model, tensor)
+                if mp_results.multi_hand_landmarks:
+                    # Hand detected: compute bounding box
+                    hand_landmarks = mp_results.multi_hand_landmarks[0]
+                    x_coords = [lm.x * w for lm in hand_landmarks.landmark]
+                    y_coords = [lm.y * h for lm in hand_landmarks.landmark]
 
-                    # Apply lightweight prediction smoothing.
-                    with self.lock:
+                    min_x, max_x = min(x_coords), max(x_coords)
+                    min_y, max_y = min(y_coords), max(y_coords)
+
+                    box_w = max_x - min_x
+                    box_h = max_y - min_y
+
+                    # Add 25% margin / padding around the hand bounding box
+                    pad_x = box_w * 0.25
+                    pad_y = box_h * 0.25
+
+                    # Clamp coordinates to frame boundaries
+                    x1 = max(0, int(min_x - pad_x))
+                    y1 = max(0, int(min_y - pad_y))
+                    x2 = min(w, int(max_x + pad_x))
+                    y2 = min(h, int(max_y + pad_y))
+
+                    hand_crop = rgb[y1:y2, x1:x2]
+
+                    if hand_crop.shape[0] > 10 and hand_crop.shape[1] > 10:
+                        # Resize crop to 128x128 using PIL bilinear resampling
+                        crop_pil = Image.fromarray(hand_crop).resize(
+                            IMG_SIZE, Image.Resampling.BILINEAR
+                        )
+                        # Normalize to float32 [0, 1] and add batch dimension
+                        tensor = np.expand_dims(
+                            np.asarray(crop_pil, dtype=np.float32) / 255.0,
+                            axis=0,
+                        )
+
+                        # 3. CNN inference
+                        raw_probs = active_model(tensor, training=False).numpy()[0]
+                        raw_probs = np.asarray(raw_probs, dtype=np.float32)
+
+                        # 4. Temporal smoothing (deque maxlen=3)
                         self.history.append(raw_probs)
-                        smoothed_probs = np.mean(self.history, axis=0)
+                        smoothed = np.mean(np.asarray(self.history), axis=0)
 
-                        pred_idx = int(np.argmax(smoothed_probs))
-                        self.latest_label = CLASS_NAMES[pred_idx]
-                        self.latest_confidence = float(smoothed_probs[pred_idx]) * 100.0
-                        self.latest_probabilities = {
-                            name: float(smoothed_probs[i]) * 100.0
-                            for i, name in enumerate(CLASS_NAMES)
+                        predicted_index = int(np.argmax(smoothed))
+                        predicted_label = CLASS_NAMES[predicted_index]
+                        confidence = float(smoothed[predicted_index] * 100.0)
+
+                        r_prob = float(smoothed[0] * 100.0)
+                        p_prob = float(smoothed[1] * 100.0)
+                        s_prob = float(smoothed[2] * 100.0)
+
+                        prob_dict = {
+                            "Rock": r_prob,
+                            "Paper": p_prob,
+                            "Scissors": s_prob,
                         }
-                        self.has_prediction = True
 
-                        current_label = self.latest_label
-                        current_conf = self.latest_confidence
+                        with self.lock:
+                            self.prediction = predicted_label
+                            self.confidence = confidence
+                            self.rock_probability = r_prob
+                            self.paper_probability = p_prob
+                            self.scissors_probability = s_prob
+                            self.probabilities = prob_dict
+                            self.hand_detected = True
+                            self.latest_frame_timestamp = time.time()
+                    else:
+                        self._set_no_hand()
+                else:
+                    # No hand detected: clear history and do NOT run CNN
+                    self._set_no_hand()
 
-                    if CV2_AVAILABLE:
-                        # Draw subtle HUD banner on the video frame
-                        h, w, _ = img.shape
-                        overlay = img.copy()
-                        cv2.rectangle(overlay, (0, 0), (w, 55), (15, 23, 42), -1)
-                        cv2.addWeighted(overlay, 0.65, img, 0.35, 0, img)
+                last_inference_time = time.monotonic()
 
-                        # Text HUD
-                        hud_text = f"{current_label.upper()}  {current_conf:.1f}%"
-                        cv2.putText(
-                            img,
-                            hud_text,
-                            (20, 38),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            1.0,
-                            (56, 189, 248),
-                            2,
-                            cv2.LINE_AA,
-                        )
+            except Exception as exc:
+                if not self.has_logged_error:
+                    print(f"[RPS Inference Error]: {exc}")
+                    self.has_logged_error = True
 
-                except Exception as e:
-                    # Non-fatal error handling: keep frame flowing
-                    if CV2_AVAILABLE:
-                        cv2.putText(
-                            img,
-                            f"Inference error: {e}",
-                            (20, 35),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.7,
-                            (0, 0, 255),
-                            2,
-                        )
-            else:
-                # Model not loaded overlay
-                if CV2_AVAILABLE:
-                    h, w, _ = img.shape
-                    cv2.rectangle(img, (0, 0), (w, 50), (0, 0, 150), -1)
-                    cv2.putText(
-                        img,
-                        "Model not loaded (models/rps_cnn.keras missing)",
-                        (15, 33),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.65,
-                        (255, 255, 255),
-                        2,
-                    )
+        hands.close()
 
-            return av.VideoFrame.from_ndarray(img, format="bgr24")
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        """
+        Lightweight WebRTC video callback.
+        Immediately queues the latest frame and returns without blocking.
+        """
+        image = frame.to_ndarray(format="bgr24")
+
+        # Put newest frame into queue; discard unconsumed frame if full
+        if self.frame_queue.full():
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+
+        try:
+            self.frame_queue.put_nowait(image)
+        except queue.Full:
+            pass
+
+        return frame
+
+    def __del__(self):
+        self.running = False
 
 
-# ==============================================================================
-# UI Component Renderers
-# ==============================================================================
-
-def render_prediction_panel(label: str, confidence: float, probabilities: dict[str, float], active: bool):
-    """Render the right-side prediction card, confidence bar, and probabilities."""
-    st.markdown("### PREDICTION")
-
-    if active:
-        display_label = CLASS_ICONS.get(label, label.upper())
-        # Styled prediction card
-        st.markdown(
-            f"""
-            <div style="
-                background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
-                border: 2px solid #38bdf8;
-                border-radius: 12px;
-                padding: 22px;
-                text-align: center;
-                box-shadow: 0 4px 14px rgba(56, 189, 248, 0.2);
-                margin-bottom: 20px;
-            ">
-                <div style="font-size: 2.2rem; font-weight: 800; color: #f8fafc; letter-spacing: 1px;">
-                    {display_label}
-                </div>
-                <div style="font-size: 1.8rem; font-weight: 600; color: #38bdf8; margin-top: 6px;">
-                    {confidence:.1f}%
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        st.markdown("#### Confidence")
-        st.progress(min(max(confidence / 100.0, 0.0), 1.0), text=f"{confidence:.1f}%")
-
-        st.markdown("#### Class Probabilities")
-        for name in CLASS_NAMES:
-            prob = probabilities.get(name, 0.0)
-            col_l, col_r = st.columns([1, 3])
-            with col_l:
-                st.write(f"**{name}**")
-            with col_r:
-                st.progress(min(max(prob / 100.0, 0.0), 1.0), text=f"{prob:.1f}%")
-
-    else:
-        # Inactive initial state
-        st.markdown(
-            """
-            <div style="
-                background-color: #1e293b;
-                border: 2px dashed #475569;
-                border-radius: 12px;
-                padding: 24px;
-                text-align: center;
-                margin-bottom: 20px;
-            ">
-                <div style="font-size: 1.3rem; color: #94a3b8;">
-                    Show your hand and make Rock, Paper, or Scissors.
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        st.markdown("#### Confidence")
-        st.progress(0.0, text="0.0%")
-
-        st.markdown("#### Class Probabilities")
-        for name in CLASS_NAMES:
-            col_l, col_r = st.columns([1, 3])
-            with col_l:
-                st.write(f"**{name}**")
-            with col_r:
-                st.progress(0.0, text="0.0%")
-
-
-# ==============================================================================
-# Main Application
-# ==============================================================================
+# ============================================================
+# STREAMLIT UI MAIN FUNCTION
+# ============================================================
 
 def main():
     st.set_page_config(
-        page_title="Rock • Paper • Scissors — AI Gesture Classifier",
+        page_title="Rock Paper Scissors AI",
         page_icon="✊",
         layout="wide",
-        initial_sidebar_state="collapsed",
     )
 
-    # Header section
-    st.markdown(
-        """
-        <div style="text-align: center; margin-bottom: 10px;">
-            <h1 style="margin: 0; font-size: 2.5rem; letter-spacing: 2px;">ROCK • PAPER • SCISSORS</h1>
-            <h3 style="margin: 4px 0; color: #38bdf8; font-weight: 500;">AI Gesture Classifier</h3>
-            <p style="color: #94a3b8; font-size: 1.05rem;">Real-time hand gesture recognition using a custom CNN</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    # Header and subtitle
+    st.html(
+        """<div style="text-align: center; padding: 8px 0 16px 0;">
+            <h1 style="font-size: 2.6rem; font-weight: 800; margin: 0 0 6px 0; color: #f8fafc; letter-spacing: 1px;">
+                ROCK &bull; PAPER &bull; SCISSORS
+            </h1>
+            <p style="font-size: 1.15rem; color: #94a3b8; margin: 0;">
+                Real-time hand gesture classification using a custom CNN
+            </p>
+        </div>"""
     )
+
     st.divider()
 
-    # Load Model
-    model = load_model(MODEL_PATH)
+    # Dependency check
+    if av is None or webrtc_streamer is None:
+        st.error("❌ Required WebRTC libraries (`streamlit-webrtc`, `av`) are not installed.")
+        st.stop()
 
-    # Status Bar: Model and Camera
-    col_stat1, col_stat2 = st.columns(2)
-    with col_stat1:
+    model = load_model()
+
+    # Status indicators
+    status_left, status_right = st.columns(2)
+
+    with status_left:
         if model is not None:
-            st.success("Model status: **Model loaded ✓**")
+            st.success("🧠 **MODEL:** Loaded ✓")
         else:
-            st.error("Model status: **Model file not found**")
+            st.error("❌ **MODEL:** Model file not found")
+            st.caption(f"Expected at: `{MODEL_PATH}`")
 
-    with col_stat2:
-        if not WEBRTC_AVAILABLE:
-            st.error("Camera status: **Camera unavailable (missing streamlit-webrtc)**")
-        else:
-            st.info("Camera status: **Camera ready**")
+    with status_right:
+        st.info("📷 **CAMERA:** Ready ✓")
 
-    # Missing Model Error Banner (if applicable)
-    if model is None:
-        st.warning(
-            f"⚠️ **Trained Model Required**\n\n"
-            f"The application checked for the trained model at:\n"
-            f"```text\n{MODEL_PATH}\n```\n\n"
-            f"**Action Required**: Save your trained model to `models/rps_cnn.keras`. In your notebook, run:\n"
-            f"```python\n"
-            f"import os\n"
-            f"os.makedirs('models', exist_ok=True)\n"
-            f"regularized_model.save('models/rps_cnn.keras')\n"
-            f"```\n"
-            f"After saving the file, refresh this page to begin live predictions."
+    # Main two-column layout
+    camera_column, prediction_column = st.columns([1.2, 1.0], gap="large")
+
+    with camera_column:
+        st.markdown("### 📷 LIVE CAMERA")
+        st.caption(
+            "Show your hand clearly to the camera. "
+            "MediaPipe detects the hand boundary, and the CNN classifies the gesture in real-time."
         )
 
-    # Missing Dependency Banner (if applicable)
-    if not WEBRTC_AVAILABLE:
-        st.error(
-            "⚠️ **Missing Dependency for Live Video**\n\n"
-            "Please install the required streaming packages by running:\n"
-            "```bash\npip install streamlit-webrtc av\n```"
-        )
-        return
-
-    # Two-Column Layout: Left (Live Camera) | Right (Prediction Panel)
-    col_camera, col_prediction = st.columns([1.2, 1.0], gap="large")
-
-    with col_camera:
-        st.markdown("### LIVE CAMERA")
-        st.caption("Click **START** below to enable continuous camera prediction.")
-
-        # WebRTC Live Video Streamer
         webrtc_ctx = webrtc_streamer(
-            key="rps-live-stream",
+            key="rps-live-camera",
             mode=WebRtcMode.SENDRECV,
-            rtc_configuration=RTC_CONFIG,
-            video_processor_factory=lambda: LiveVideoProcessor(model),
-            media_stream_constraints={"video": True, "audio": False},
+            video_processor_factory=RPSVideoProcessor,
+            media_stream_constraints={
+                "video": {
+                    "width": {"ideal": 640, "max": 640},
+                    "height": {"ideal": 480, "max": 480},
+                    "frameRate": {"ideal": 15, "max": 20},
+                },
+                "audio": False,
+            },
             async_processing=True,
         )
 
         if webrtc_ctx.state.playing:
-            st.success("🟢 Streaming live video... Showing real-time CNN predictions.")
+            st.success("🟢 Live prediction is running")
         else:
-            st.info("Waiting for video stream. Click **START** above to begin.")
+            st.info("Click START to begin live prediction.")
 
-    with col_prediction:
-        prediction_placeholder = st.empty()
+    with prediction_column:
+        st.markdown("### 🎯 PREDICTION")
 
-        # Initial inactive render
-        with prediction_placeholder.container():
-            render_prediction_panel(
-                label="Awaiting hand gesture...",
-                confidence=0.0,
-                probabilities={"Rock": 0.0, "Paper": 0.0, "Scissors": 0.0},
-                active=False,
-            )
+        @st.fragment(run_every=0.25)
+        def render_prediction_panel():
+            is_playing = bool(webrtc_ctx and webrtc_ctx.state.playing)
+            processor = None
 
-    # Live UI update loop while camera is active
-    if webrtc_ctx.state.playing:
-        while webrtc_ctx.state.playing:
-            if webrtc_ctx.video_processor:
-                with webrtc_ctx.video_processor.lock:
-                    has_pred = webrtc_ctx.video_processor.has_prediction
-                    lbl = webrtc_ctx.video_processor.latest_label
-                    conf = webrtc_ctx.video_processor.latest_confidence
-                    probs = dict(webrtc_ctx.video_processor.latest_probabilities)
+            if is_playing:
+                processor = webrtc_ctx.video_processor or RPSVideoProcessor.latest_instance
 
-                if has_pred:
-                    with prediction_placeholder.container():
-                        render_prediction_panel(lbl, conf, probs, active=True)
-                elif lbl == "No Gesture":
-                    with prediction_placeholder.container():
-                        render_prediction_panel(
-                            label="No Gesture",
-                            confidence=0.0,
-                            probabilities={
-                                "Rock": 0.0,
-                                "Paper": 0.0,
-                                "Scissors": 0.0,
-                            },
-                            active=False,
-                        )
-            time.sleep(0.08)
+            if is_playing and processor is not None:
+                with processor.lock:
+                    pred = processor.prediction
+                    conf = processor.confidence
+                    r_prob = processor.rock_probability
+                    p_prob = processor.paper_probability
+                    s_prob = processor.scissors_probability
+                    hand_found = processor.hand_detected
 
-    # Model Information Footer Panel
+                if hand_found:
+                    icon = CLASS_ICONS.get(pred, "")
+                    with st.container(border=True):
+                        st.caption("CNN PREDICTION")
+                        st.markdown(f"## {icon} {pred.upper()}")
+                        st.metric(label="Confidence", value=f"{conf:.1f}%")
+                        st.progress(min(max(conf / 100.0, 0.0), 1.0))
+                else:
+                    with st.container(border=True):
+                        st.caption("CNN PREDICTION")
+                        st.markdown("## ✋ NO HAND DETECTED")
+                        st.info("Show your hand clearly to the camera.")
+                        st.metric(label="Confidence", value="0.0%")
+                        st.progress(0.0)
+
+                st.markdown("#### Class probabilities")
+
+                # ✊ Rock row
+                col_r1, col_r2 = st.columns([2, 1])
+                with col_r1:
+                    st.write("✊ **Rock**")
+                with col_r2:
+                    st.write(f"**{r_prob:.1f}%**")
+                st.progress(min(max(r_prob / 100.0, 0.0), 1.0))
+
+                # ✋ Paper row
+                col_p1, col_p2 = st.columns([2, 1])
+                with col_p1:
+                    st.write("✋ **Paper**")
+                with col_p2:
+                    st.write(f"**{p_prob:.1f}%**")
+                st.progress(min(max(p_prob / 100.0, 0.0), 1.0))
+
+                # ✌️ Scissors row (ALWAYS visible)
+                col_s1, col_s2 = st.columns([2, 1])
+                with col_s1:
+                    st.write("✌️ **Scissors**")
+                with col_s2:
+                    st.write(f"**{s_prob:.1f}%**")
+                st.progress(min(max(s_prob / 100.0, 0.0), 1.0))
+
+            else:
+                with st.container(border=True):
+                    st.markdown("### 📷 Camera Ready")
+                    st.write("Click **START** on the camera view to begin live gesture prediction.")
+                    st.caption("The custom CNN classifies cropped hand regions at 128×128 RGB resolution.")
+
+                st.markdown("#### Class probabilities")
+                for name in CLASS_NAMES:
+                    c1, c2 = st.columns([2, 1])
+                    with c1:
+                        st.write(f"{CLASS_ICONS[name]} **{name}**")
+                    with c2:
+                        st.write("**0.0%**")
+                    st.progress(0.0)
+
+        render_prediction_panel()
+
+    # Model Information footer
     st.divider()
-    st.markdown("### MODEL INFORMATION")
-    info_col1, info_col2, info_col3, info_col4 = st.columns(4)
-    with info_col1:
-        st.metric(label="Architecture", value="Custom CNN + Dropout")
-    with info_col2:
-        st.metric(label="Input Dimension", value="128 × 128 × 3")
-    with info_col3:
-        st.metric(label="Classes", value="Rock • Paper • Scissors")
-    with info_col4:
-        st.metric(label="Recorded Test Accuracy", value="98.66%")
+    st.markdown("### 🧠 MODEL INFORMATION")
 
-    st.caption("Note: Test accuracy is 98.66% on the TFDS rock_paper_scissors test split (Regularized CNN). Actual prediction confidence depends on lighting, framing, and hand orientation.")
+    info1, info2, info3, info4 = st.columns(4)
+
+    with info1:
+        st.metric("Model", "RPS CNN")
+
+    with info2:
+        st.metric("Input", "128 × 128 × 3")
+
+    with info3:
+        st.metric("Classes", "Rock / Paper / Scissors")
+
+    with info4:
+        st.metric("Recorded test accuracy", "96.51%")
+
+    st.caption(
+        "Architecture: Custom CNN + Dropout. "
+        "Input preprocessing: 128×128 RGB normalized to [0, 1]. "
+        "Class mapping: 0 = Rock, 1 = Paper, 2 = Scissors. "
+        "Hand localization: MediaPipe Hands (detector gate)."
+    )
 
 
 if __name__ == "__main__":
